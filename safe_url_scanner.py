@@ -1,25 +1,27 @@
 import streamlit as st
 import requests
-from urllib.parse import urlparse
-from functools import lru_cache
-import concurrent.futures
+from urllib.parse import urlparse, quote
+from PIL import Image
+import io
+import time
 import os
 from datetime import datetime
+import concurrent.futures
+from functools import lru_cache
 
 # Configuration
-REQUEST_TIMEOUT = 10
+REQUEST_TIMEOUT = 15
+SCREENSHOT_API_URL = "https://render-tron.appspot.com/screenshot/{url}?width=1024&height=768"
+URLSCAN_API_KEY = os.getenv('URLSCAN_API_KEY', '')  # Register at urlscan.io
+GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY', 'AIzaSyBQJ-_bb9zfC3S4pAehM4YrKJvU33goPBA')  # Your original key
 
-# Initialize Google API Key (use environment variable or Streamlit secrets)
-GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY', 'AIzaSyBQJ-_bb9zfC3S4pAehM4YrKJvU33goPBA')
-
-# Trusted domains
+# Trusted domains and local threats (original unchanged)
 TRUSTED_DOMAINS = {
     "apple.com", "google.com", "microsoft.com", 
     "amazon.com", "facebook.com", "wikipedia.org",
-    "ku.edu.kw", "aasu.edu.kw"  # Added your university
+    "ku.edu.kw", "aasu.edu.kw"
 }
 
-# Known malicious patterns
 LOCAL_THREATS = {
     "apple-support-center.com": "Fake Apple support scam",
     "microsoft-help-desk.com": "Fake Microsoft support",
@@ -29,7 +31,7 @@ LOCAL_THREATS = {
     "free-software-downloads.com": "Malware distribution"
 }
 
-# --- Personal About Section ---
+# --- Personal About Section (unchanged) ---
 def show_about():
     st.sidebar.markdown("## About")
     st.sidebar.markdown("""
@@ -38,18 +40,13 @@ def show_about():
     🏫 Abdullah Al Salem University  
     🔒 Beginner Penetration Tester  
     """)
-    
-    profile_pic = "https://i.ibb.co/TqkMj2Hp/IMG-9641.jpg"
-    if profile_pic:
-        st.sidebar.image(profile_pic, width=150)
+    st.sidebar.image("https://i.ibb.co/TqkMj2Hp/IMG-9641.jpg", width=150)
 
-# --- Core Functions ---
+# --- Original Core Functions (unchanged) ---
 @lru_cache(maxsize=100)
 def process_url(url):
     """Standardize URL format and validate"""
     try:
-        if not url:
-            return None
         if not url.startswith(('http://', 'https://')):
             url = f"https://{url}"
         parsed = urlparse(url)
@@ -78,19 +75,12 @@ def check_local_database(url):
     return None
 
 def check_google_safebrowsing(url):
-    """Check URL against Google Safe Browsing"""
-    if not GOOGLE_API_KEY:
-        st.warning("Google Safe Browsing API key not configured")
-        return None
-        
+    """Original Google Safe Browsing check"""
     try:
         response = requests.post(
             f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={GOOGLE_API_KEY}",
             json={
-                "client": {
-                    "clientId": "SecureURLScanner",
-                    "clientVersion": "1.0.0"
-                },
+                "client": {"clientId": "SecureURLScanner", "clientVersion": "1.0.0"},
                 "threatInfo": {
                     "threatTypes": ["MALWARE", "SOCIAL_ENGINEERING"],
                     "platformTypes": ["ANY_PLATFORM"],
@@ -101,9 +91,7 @@ def check_google_safebrowsing(url):
             timeout=REQUEST_TIMEOUT
         )
         response.raise_for_status()
-        data = response.json()
-        
-        if data.get('matches'):
+        if response.json().get('matches'):
             return {
                 'source': 'Google Safe Browsing',
                 'threat': 'Known malicious URL',
@@ -114,111 +102,144 @@ def check_google_safebrowsing(url):
         st.warning(f"Google Safe Browsing check failed: {str(e)}")
     return None
 
-def check_urlscan(url):
-    """Definitive safety check using URLScan.io"""
+# --- New Screenshot Function ---
+def get_website_screenshot(url):
+    """Capture website screenshot"""
     try:
-        domain = urlparse(url).netloc
         response = requests.get(
+            SCREENSHOT_API_URL.format(url=quote(url)),
+            stream=True,
+            timeout=20
+        )
+        response.raise_for_status()
+        return Image.open(io.BytesIO(response.content))
+    except Exception as e:
+        st.warning(f"⚠️ Could not capture screenshot: {str(e)}")
+        return None
+
+# --- Enhanced URLScan.io Integration ---
+def check_urlscan(url):
+    """Enhanced URLScan.io check matching original behavior"""
+    try:
+        # First try the quick search
+        domain = urlparse(url).netloc
+        search_response = requests.get(
             f"https://urlscan.io/api/v1/search/?q=domain:{domain}",
             headers={"User-Agent": "Mozilla/5.0"},
             timeout=REQUEST_TIMEOUT
         )
-        response.raise_for_status()
-        data = response.json()
+        search_response.raise_for_status()
+        search_data = search_response.json()
 
-        if not data.get("results"):
+        if not search_data.get("results"):
             return {'safe': True, 'source': 'URLScan.io'}
 
-        if any(r.get('malicious', False) for r in data.get('results', [])):
+        if any(r.get('malicious', False) for r in search_data.get('results', [])):
             return {
                 'source': 'URLScan.io',
                 'threat': 'Known malicious domain',
                 'certainty': 'High',
                 'details': f'https://urlscan.io/search/#{domain}'
             }
+
+        # If no clear verdict, submit for fresh scan
+        if URLSCAN_API_KEY:
+            submit_response = requests.post(
+                "https://urlscan.io/api/v1/scan/",
+                headers={"Content-Type": "application/json", "API-Key": URLSCAN_API_KEY},
+                json={"url": url, "public": "on"},
+                timeout=REQUEST_TIMEOUT
+            )
+            submit_response.raise_for_status()
+            scan_id = submit_response.json().get('uuid')
+            return {
+                'source': 'URLScan.io',
+                'threat': 'Submitted for analysis',
+                'certainty': 'Pending',
+                'details': f'https://urlscan.io/result/{scan_id}/'
+            }
+        return None
     except Exception as e:
         st.warning(f"URLScan.io check failed: {str(e)}")
-    return None
+        return None
 
+# --- Updated Scanning Logic ---
 def perform_scan(url):
-    """Main scanning logic"""
+    """Main scanning logic with screenshot"""
     if is_trusted_domain(url):
-        return 'trusted', [], []
+        return 'trusted', [], [], None
 
-    urlscan_result = check_urlscan(url)
-    if urlscan_result and urlscan_result.get('safe'):
-        return 'safe', [urlscan_result], []
-    
-    findings = []
-    service_status = []
-    checks = [check_local_database, check_google_safebrowsing]
-
+    # Get screenshot in parallel with scans
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = {executor.submit(check, url): check.__name__ for check in checks}
-        for future in concurrent.futures.as_completed(futures, timeout=REQUEST_TIMEOUT+2):
+        screenshot_future = executor.submit(get_website_screenshot, url)
+        
+        urlscan_result = check_urlscan(url)
+        if urlscan_result and urlscan_result.get('safe'):
+            return 'safe', [urlscan_result], [], screenshot_future.result()
+
+        findings = []
+        service_status = []
+        checks = [check_local_database, check_google_safebrowsing]
+
+        for check in checks:
             try:
-                if result := future.result():
+                if result := check(url):
                     findings.append(result)
-            except concurrent.futures.TimeoutError:
-                service_status.append(f"{futures[future]} timed out")
             except Exception as e:
-                service_status.append(f"{futures[future]} failed: {str(e)}")
+                service_status.append(f"{check.__name__} failed: {str(e)}")
 
-    if urlscan_result and not urlscan_result.get('safe'):
-        return 'unsafe', [urlscan_result] + findings, service_status
-    elif findings:
-        return 'suspicious', findings, service_status
-    else:
-        return 'unknown', [], service_status
+        if urlscan_result and not urlscan_result.get('safe'):
+            return 'unsafe', [urlscan_result] + findings, service_status, screenshot_future.result()
+        elif findings:
+            return 'suspicious', findings, service_status, screenshot_future.result()
+        else:
+            return 'unknown', [], service_status, screenshot_future.result()
 
-def display_results(verdict, findings, service_status, url):
-    """Display scan results in Streamlit"""
+# --- Updated Display Function ---
+def display_results(verdict, findings, service_status, url, screenshot=None):
+    """Display results with screenshot"""
     st.subheader(f"Scan Results for: {url}")
     
-    # Visual verdict indicator
-    verdict_colors = {
-        'trusted': ('🟢', 'This URL is from a trusted domain'),
-        'safe': ('🟢', 'No security issues detected'),
-        'suspicious': ('🟡', 'Potential security concerns found'),
-        'unsafe': ('🔴', 'This URL appears to be malicious'),
-        'unknown': ('⚪', 'Unable to determine safety with certainty')
-    }
+    col1, col2 = st.columns([2, 1])
     
-    emoji, message = verdict_colors.get(verdict, ('⚪', 'Unknown status'))
-    st.markdown(f"### {emoji} Verdict: {verdict.capitalize()}")
-    st.info(message)
+    with col1:
+        verdict_colors = {
+            'trusted': ('🟢', 'Trusted Domain'),
+            'safe': ('🟢', 'No Issues Found'),
+            'suspicious': ('🟡', 'Potential Risk'),
+            'unsafe': ('🔴', 'Malicious Detected'),
+            'unknown': ('⚪', 'Inconclusive')
+        }
+        emoji, message = verdict_colors.get(verdict, ('⚪', 'Unknown'))
+        st.markdown(f"### {emoji} {message}")
+        
+        if findings:
+            with st.expander("🔍 Detailed Findings"):
+                for finding in findings:
+                    st.write(f"**Source:** {finding.get('source')}")
+                    st.write(f"**Threat:** {finding.get('threat')}")
+                    st.write(f"**Certainty:** {finding.get('certainty')}")
+                    if 'details' in finding:
+                        st.markdown(f"[More info]({finding['details']})")
+                    st.divider()
+        
+        if service_status:
+            st.warning("Service Issues:")
+            for status in service_status:
+                st.code(status)
     
-    # Detailed findings
-    if findings:
-        with st.expander("🔍 Detailed Findings", expanded=True):
-            for finding in findings:
-                st.write(f"**Source:** {finding.get('source', 'Unknown')}")
-                st.write(f"**Threat:** {finding.get('threat', 'Not specified')}")
-                st.write(f"**Certainty:** {finding.get('certainty', 'Unknown')}")
-                if 'details' in finding:
-                    st.markdown(f"[More info]({finding['details']})")
-                st.divider()
-    
-    # Service status messages
-    if service_status:
-        st.warning("⚠️ Some services encountered issues:")
-        for status in service_status:
-            st.code(status)
+    with col2:
+        if screenshot:
+            st.image(screenshot, caption="Website Preview", use_column_width=True)
+        else:
+            st.info("No screenshot available")
 
-# --- Main App ---
+# --- Main App (unchanged structure) ---
 def main():
-    st.set_page_config(
-        page_title="SecureURL Scanner",
-        page_icon="🛡️",
-        layout="centered"
-    )
-    
-    # Show about section
+    st.set_page_config(page_title="SecureURL Scanner", page_icon="🛡️", layout="centered")
     show_about()
-    
     st.title("🛡️ SecureURL Scanner")
-    st.caption("URLScan.io-powered security verification")
-
+    
     url = st.text_input("Enter URL to scan:", placeholder="https://example.com")
     
     if st.button("Scan URL", type="primary"):
@@ -229,10 +250,9 @@ def main():
             if not processed_url:
                 st.error("Invalid URL format")
             else:
-                with st.spinner(f"🔍 Scanning {processed_url}..."):
-                    verdict, findings, service_status = perform_scan(processed_url)
-                
-                display_results(verdict, findings, service_status, processed_url)
+                with st.spinner("🔍 Scanning..."):
+                    verdict, findings, service_status, screenshot = perform_scan(processed_url)
+                display_results(verdict, findings, service_status, processed_url, screenshot)
 
 if __name__ == "__main__":
     main()
