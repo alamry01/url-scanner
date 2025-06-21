@@ -31,45 +31,103 @@ LOCAL_THREATS = {
     "free-software-downloads.com": "Malware distribution"
 }
 
-# --- Reliable Screenshot Service ---
-SCREENSHOT_API = {
-    "url": "https://api.screenshotlayer.com/api/capture",
-    "params": {
-        "access_key": "YOUR_FREE_API_KEY",  # Get from screenshotlayer.com
-        "url": "{url}",
-        "viewport": "1440x900",
-        "fullpage": "1",
-        "format": "PNG"
+# --- Improved Screenshot Services ---
+SCREENSHOT_SERVICES = [
+    {
+        "name": "ScreenshotAPI.com",
+        "url": "https://screenshotapi.net/api/v1/screenshot",
+        "params": {
+            "url": "{url}",
+            "token": "YOUR_API_KEY"  # Get free tier from screenshotapi.net
+        },
+        "headers": {"Accept": "image/png"}
     },
-    "timeout": 15,
-    "headers": {"User-Agent": "Mozilla/5.0"}
-}
+    {
+        "name": "APIFlash (Free Tier)",
+        "url": "https://api.apiflash.com/v1/urltoimage",
+        "params": {
+            "url": "{url}",
+            "access_key": "YOUR_API_KEY",  # Get from apiflash.com
+            "fresh": "true",
+            "full_page": "true",
+            "delay": "2"
+        }
+    }
+]
 
 def get_website_screenshot(url):
-    """Get screenshot using ScreenshotLayer API"""
+    """Try multiple screenshot services with fallback"""
+    for service in SCREENSHOT_SERVICES:
+        try:
+            params = {k: v.format(url=quote(url)) for k, v in service["params"].items()}
+            headers = service.get("headers", {})
+            
+            response = requests.get(
+                service["url"],
+                params=params,
+                headers=headers,
+                stream=True,
+                timeout=15
+            )
+            response.raise_for_status()
+            
+            if response.headers.get('Content-Type', '').startswith('image/'):
+                img = Image.open(io.BytesIO(response.content))
+                if img.size[0] > 10:  # Basic validation
+                    return img, service["name"]
+        except Exception as e:
+            st.warning(f"{service['name']} screenshot failed: {str(e)}")
+            continue
+    
+    # Fallback to simple preview if all services fail
     try:
-        # Format parameters
-        params = {k: v.format(url=quote(url)) for k, v in SCREENSHOT_API["params"].items()}
-        
-        response = requests.get(
-            SCREENSHOT_API["url"],
-            params=params,
-            stream=True,
-            timeout=SCREENSHOT_API["timeout"],
-            headers=SCREENSHOT_API["headers"]
-        )
-        response.raise_for_status()
-        
-        # Verify image content
-        if response.headers.get('Content-Type', '').startswith('image/'):
-            img = Image.open(io.BytesIO(response.content))
-            if img.size[0] > 10:  # Basic validation
-                return img
-    except Exception as e:
-        st.warning(f"Screenshot service error: {str(e)}")
-    return None
+        response = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        if response.status_code == 200:
+            return None, "Page loaded successfully but no screenshot available"
+    except:
+        pass
+    
+    return None, "Screenshot service unavailable"
 
-# --- Core Functions (Unchanged from your original) ---
+# --- Website Information Gathering ---
+def get_website_info(url):
+    """Collect basic website information"""
+    info = {
+        "domain": urlparse(url).netloc,
+        "ip": "N/A",
+        "server": "N/A",
+        "ssl": "N/A",
+        "load_time": "N/A",
+        "status": "N/A"
+    }
+    
+    try:
+        start_time = time.time()
+        response = requests.head(
+            url, 
+            timeout=10, 
+            allow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        info["load_time"] = f"{round((time.time() - start_time) * 1000)} ms"
+        info["status"] = response.status_code
+        
+        # Get server info if available
+        if 'Server' in response.headers:
+            info["server"] = response.headers['Server']
+        
+        # Check SSL (very basic check)
+        if url.startswith('https://'):
+            info["ssl"] = "🔒 Yes" if response.status_code == 200 else "⚠️ Issues"
+        else:
+            info["ssl"] = "❌ No"
+            
+    except Exception as e:
+        info["error"] = str(e)
+    
+    return info
+
+# --- Core Functions ---
 @lru_cache(maxsize=100)
 def process_url(url):
     """Standardize and validate URL"""
@@ -176,19 +234,22 @@ def check_urlscan(url):
 def perform_scan(url):
     """Perform all security checks and capture screenshot"""
     if is_trusted_domain(url):
-        return 'trusted', [], [], None, None
+        return 'trusted', [], [], None, None, None
 
     screenshot = None
-    screenshot_error = None
+    screenshot_source = None
+    website_info = None
     
-    # Get screenshot in parallel with security checks
+    # Run checks in parallel
     with concurrent.futures.ThreadPoolExecutor() as executor:
         screenshot_future = executor.submit(get_website_screenshot, url)
+        info_future = executor.submit(get_website_info, url)
         
         urlscan_result = check_urlscan(url)
         if urlscan_result and urlscan_result.get('safe'):
-            screenshot = screenshot_future.result()
-            return 'safe', [urlscan_result], [], screenshot, None
+            screenshot, screenshot_source = screenshot_future.result()
+            website_info = info_future.result()
+            return 'safe', [urlscan_result], [], screenshot, screenshot_source, website_info
 
         findings = []
         service_status = []
@@ -201,20 +262,19 @@ def perform_scan(url):
             except Exception as e:
                 service_status.append(f"{check.__name__} failed: {str(e)}")
 
-        screenshot = screenshot_future.result()
-        if not screenshot:
-            screenshot_error = "Could not capture screenshot"
+        screenshot, screenshot_source = screenshot_future.result()
+        website_info = info_future.result()
 
         if urlscan_result and not urlscan_result.get('safe'):
-            return 'unsafe', [urlscan_result] + findings, service_status, screenshot, screenshot_error
+            return 'unsafe', [urlscan_result] + findings, service_status, screenshot, screenshot_source, website_info
         elif findings:
-            return 'suspicious', findings, service_status, screenshot, screenshot_error
+            return 'suspicious', findings, service_status, screenshot, screenshot_source, website_info
         else:
-            return 'unknown', [], service_status, screenshot, screenshot_error
+            return 'unknown', [], service_status, screenshot, screenshot_source, website_info
 
 # --- Display Results ---
-def display_results(verdict, findings, service_status, url, screenshot, screenshot_error):
-    """Show results with screenshot"""
+def display_results(verdict, findings, service_status, url, screenshot, screenshot_source, website_info):
+    """Show results with screenshot and website info"""
     st.subheader(f"Scan Results for: {url}")
     
     col1, col2 = st.columns([2, 1])
@@ -247,11 +307,26 @@ def display_results(verdict, findings, service_status, url, screenshot, screensh
     
     with col2:
         if screenshot:
-            st.image(screenshot, caption="Website Preview", use_container_width=True)
-        elif screenshot_error:
-            st.error(screenshot_error)
+            st.image(screenshot, caption=f"Website Preview ({screenshot_source})", use_column_width=True)
+        elif screenshot_source:
+            st.info(screenshot_source)
         else:
-            st.info("Screenshot not available")
+            st.warning("No preview available")
+    
+    # Website information section
+    st.subheader("📊 Website Information")
+    if website_info:
+        cols = st.columns(3)
+        with cols[0]:
+            st.metric("Domain", website_info.get("domain", "N/A"))
+            st.metric("Server", website_info.get("server", "N/A"))
+        with cols[1]:
+            st.metric("SSL", website_info.get("ssl", "N/A"))
+            st.metric("Status Code", website_info.get("status", "N/A"))
+        with cols[2]:
+            st.metric("Load Time", website_info.get("load_time", "N/A"))
+    else:
+        st.warning("Could not retrieve website information")
 
 # --- Main App ---
 def main():
@@ -285,8 +360,8 @@ def main():
                 st.error("Invalid URL format")
             else:
                 with st.spinner("🔍 Analyzing URL..."):
-                    verdict, findings, service_status, screenshot, screenshot_error = perform_scan(processed_url)
-                display_results(verdict, findings, service_status, processed_url, screenshot, screenshot_error)
+                    verdict, findings, service_status, screenshot, screenshot_source, website_info = perform_scan(processed_url)
+                display_results(verdict, findings, service_status, processed_url, screenshot, screenshot_source, website_info)
 
 if __name__ == "__main__":
     main()
