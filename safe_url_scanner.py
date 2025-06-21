@@ -135,12 +135,13 @@ def check_urlscan(url):
         st.warning(f"URLScan.io check failed: {str(e)}")
         return None
 
-# --- Screenshot Function ---
+# --- Improved Screenshot Function ---
 def get_website_screenshot(url):
-    """Get website screenshot"""
+    """Get website screenshot with better error handling"""
     services = [
         {"url": "https://render-tron.appspot.com/screenshot/{url}?width=800&height=600", "timeout": 15},
-        {"url": "https://s0.wp.com/mshots/v1/{url}?w=800&h=600", "timeout": 10}
+        {"url": "https://s0.wp.com/mshots/v1/{url}?w=800&h=600", "timeout": 10},
+        {"url": "https://api.pagepeeker.com/v2/thumbs.php?size=l&url={url}", "timeout": 10}
     ]
     
     for service in services:
@@ -152,55 +153,62 @@ def get_website_screenshot(url):
                 headers={'User-Agent': 'Mozilla/5.0'}
             )
             response.raise_for_status()
-            img = Image.open(io.BytesIO(response.content))
-            if img.size[0] > 10:
-                return img
-        except:
+            
+            # Verify we actually got an image
+            if response.headers.get('Content-Type', '').startswith('image/'):
+                img = Image.open(io.BytesIO(response.content))
+                if img.size[0] > 10:  # Basic validation
+                    return img
+        except Exception as e:
             continue
+    
     return None
 
 # --- Scanning Logic ---
 def perform_scan(url):
-    """Perform all checks"""
+    """Perform all checks with screenshot"""
     if is_trusted_domain(url):
         return 'trusted', [], [], None, None
 
     screenshot = None
     screenshot_error = None
     
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        screenshot_future = executor.submit(get_website_screenshot, url)
-        
-        urlscan_result = check_urlscan(url)
-        if urlscan_result and urlscan_result.get('safe'):
-            screenshot = screenshot_future.result()
-            return 'safe', [urlscan_result], [], screenshot, None
+    # First try to get screenshot with timeout
+    try:
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            screenshot_future = executor.submit(get_website_screenshot, url)
+            screenshot = screenshot_future.result(timeout=15)  # Wait max 15 seconds
+    except concurrent.futures.TimeoutError:
+        screenshot_error = "Screenshot timed out (took too long)"
+    except Exception as e:
+        screenshot_error = f"Screenshot error: {str(e)}"
 
-        findings = []
-        service_status = []
-        checks = [check_local_database, check_google_safebrowsing]
+    # Run security checks
+    urlscan_result = check_urlscan(url)
+    if urlscan_result and urlscan_result.get('safe'):
+        return 'safe', [urlscan_result], [], screenshot, screenshot_error
 
-        for check in checks:
-            try:
-                if result := check(url):
-                    findings.append(result)
-            except Exception as e:
-                service_status.append(f"{check.__name__} failed: {str(e)}")
+    findings = []
+    service_status = []
+    checks = [check_local_database, check_google_safebrowsing]
 
-        screenshot = screenshot_future.result()
-        if not screenshot:
-            screenshot_error = "Could not capture screenshot"
+    for check in checks:
+        try:
+            if result := check(url):
+                findings.append(result)
+        except Exception as e:
+            service_status.append(f"{check.__name__} failed: {str(e)}")
 
-        if urlscan_result and not urlscan_result.get('safe'):
-            return 'unsafe', [urlscan_result] + findings, service_status, screenshot, screenshot_error
-        elif findings:
-            return 'suspicious', findings, service_status, screenshot, screenshot_error
-        else:
-            return 'unknown', [], service_status, screenshot, screenshot_error
+    if urlscan_result and not urlscan_result.get('safe'):
+        return 'unsafe', [urlscan_result] + findings, service_status, screenshot, screenshot_error
+    elif findings:
+        return 'suspicious', findings, service_status, screenshot, screenshot_error
+    else:
+        return 'unknown', [], service_status, screenshot, screenshot_error
 
 # --- Display Results ---
 def display_results(verdict, findings, service_status, url, screenshot, screenshot_error):
-    """Show results"""
+    """Show results with proper image display"""
     st.subheader(f"Scan Results for: {url}")
     
     col1, col2 = st.columns([2, 1])
@@ -233,7 +241,7 @@ def display_results(verdict, findings, service_status, url, screenshot, screensh
     
     with col2:
         if screenshot:
-            st.image(screenshot, caption="Website Preview", use_column_width=True)
+            st.image(screenshot, caption="Website Preview", use_container_width=True)  # Fixed parameter
         elif screenshot_error:
             st.error(screenshot_error)
         else:
