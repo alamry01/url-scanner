@@ -1,26 +1,27 @@
 import streamlit as st
 import requests
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
+from PIL import Image
+import io
+import time
+import os
 from datetime import datetime
 import concurrent.futures
 from functools import lru_cache
-import os
-from playwright.sync_api import sync_playwright
-from PIL import Image
-import io
 
 # Configuration
 REQUEST_TIMEOUT = 20
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY', 'AIzaSyBQJ-_bb9zfC3S4pAehM4YrKJvU33goPBA')
 URLSCAN_API_KEY = os.getenv('URLSCAN_API_KEY', '')
 
-# Trusted domains and threats (unchanged)
+# Trusted domains
 TRUSTED_DOMAINS = {
     "apple.com", "google.com", "microsoft.com", 
     "amazon.com", "facebook.com", "wikipedia.org",
     "ku.edu.kw", "aasu.edu.kw"
 }
 
+# Known malicious patterns
 LOCAL_THREATS = {
     "apple-support-center.com": "Fake Apple support scam",
     "microsoft-help-desk.com": "Fake Microsoft support",
@@ -30,26 +31,45 @@ LOCAL_THREATS = {
     "free-software-downloads.com": "Malware distribution"
 }
 
-# --- Playwright Screenshot Capture ---
-def get_website_screenshot(url):
-    """Capture screenshot using Playwright (like urlscan.io)"""
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                viewport={'width': 1280, 'height': 720},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            )
-            page = context.new_page()
-            page.goto(url, wait_until="networkidle", timeout=15000)
-            screenshot = page.screenshot(full_page=True)
-            browser.close()
-            return Image.open(io.BytesIO(screenshot))
-    except Exception as e:
-        st.warning(f"⚠️ Screenshot failed: {str(e)}")
-        return None
+# --- Reliable Screenshot Service ---
+SCREENSHOT_API = {
+    "url": "https://api.screenshotlayer.com/api/capture",
+    "params": {
+        "access_key": "YOUR_FREE_API_KEY",  # Get from screenshotlayer.com
+        "url": "{url}",
+        "viewport": "1440x900",
+        "fullpage": "1",
+        "format": "PNG"
+    },
+    "timeout": 15,
+    "headers": {"User-Agent": "Mozilla/5.0"}
+}
 
-# --- Core Security Functions (Unchanged) ---
+def get_website_screenshot(url):
+    """Get screenshot using ScreenshotLayer API"""
+    try:
+        # Format parameters
+        params = {k: v.format(url=quote(url)) for k, v in SCREENSHOT_API["params"].items()}
+        
+        response = requests.get(
+            SCREENSHOT_API["url"],
+            params=params,
+            stream=True,
+            timeout=SCREENSHOT_API["timeout"],
+            headers=SCREENSHOT_API["headers"]
+        )
+        response.raise_for_status()
+        
+        # Verify image content
+        if response.headers.get('Content-Type', '').startswith('image/'):
+            img = Image.open(io.BytesIO(response.content))
+            if img.size[0] > 10:  # Basic validation
+                return img
+    except Exception as e:
+        st.warning(f"Screenshot service error: {str(e)}")
+    return None
+
+# --- Core Functions (Unchanged from your original) ---
 @lru_cache(maxsize=100)
 def process_url(url):
     """Standardize and validate URL"""
@@ -64,12 +84,12 @@ def process_url(url):
         return None
 
 def is_trusted_domain(url):
-    """Check if domain is in trusted list"""
+    """Check if domain is in our trusted list"""
     domain = urlparse(url).netloc.lower()
     return any(domain.endswith(f".{t}") or domain == t for t in TRUSTED_DOMAINS)
 
 def check_local_database(url):
-    """Check against local threats"""
+    """Check against local threat database"""
     domain = urlparse(url).netloc.lower()
     for threat_domain, description in LOCAL_THREATS.items():
         if threat_domain in domain:
@@ -154,43 +174,43 @@ def check_urlscan(url):
 
 # --- Scanning Logic ---
 def perform_scan(url):
-    """Perform all checks with Playwright screenshot"""
+    """Perform all security checks and capture screenshot"""
     if is_trusted_domain(url):
         return 'trusted', [], [], None, None
 
     screenshot = None
     screenshot_error = None
     
-    # Run security checks first
-    urlscan_result = check_urlscan(url)
-    if urlscan_result and urlscan_result.get('safe'):
-        with st.spinner("📸 Capturing website screenshot..."):
-            screenshot = get_website_screenshot(url)
-        return 'safe', [urlscan_result], [], screenshot, None
+    # Get screenshot in parallel with security checks
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        screenshot_future = executor.submit(get_website_screenshot, url)
+        
+        urlscan_result = check_urlscan(url)
+        if urlscan_result and urlscan_result.get('safe'):
+            screenshot = screenshot_future.result()
+            return 'safe', [urlscan_result], [], screenshot, None
 
-    findings = []
-    service_status = []
-    checks = [check_local_database, check_google_safebrowsing]
+        findings = []
+        service_status = []
+        checks = [check_local_database, check_google_safebrowsing]
 
-    for check in checks:
-        try:
-            if result := check(url):
-                findings.append(result)
-        except Exception as e:
-            service_status.append(f"{check.__name__} failed: {str(e)}")
+        for check in checks:
+            try:
+                if result := check(url):
+                    findings.append(result)
+            except Exception as e:
+                service_status.append(f"{check.__name__} failed: {str(e)}")
 
-    # Capture screenshot last to avoid delays
-    with st.spinner("📸 Capturing website screenshot..."):
-        screenshot = get_website_screenshot(url)
+        screenshot = screenshot_future.result()
         if not screenshot:
-            screenshot_error = "Screenshot capture failed"
+            screenshot_error = "Could not capture screenshot"
 
-    if urlscan_result and not urlscan_result.get('safe'):
-        return 'unsafe', [urlscan_result] + findings, service_status, screenshot, screenshot_error
-    elif findings:
-        return 'suspicious', findings, service_status, screenshot, screenshot_error
-    else:
-        return 'unknown', [], service_status, screenshot, screenshot_error
+        if urlscan_result and not urlscan_result.get('safe'):
+            return 'unsafe', [urlscan_result] + findings, service_status, screenshot, screenshot_error
+        elif findings:
+            return 'suspicious', findings, service_status, screenshot, screenshot_error
+        else:
+            return 'unknown', [], service_status, screenshot, screenshot_error
 
 # --- Display Results ---
 def display_results(verdict, findings, service_status, url, screenshot, screenshot_error):
@@ -252,7 +272,7 @@ def main():
     st.sidebar.image("https://i.ibb.co/TqkMj2Hp/IMG-9641.jpg", width=150)
     
     st.title("🛡️ SecureURL Scanner")
-    st.caption("Professional URL analysis with browser-grade screenshots")
+    st.caption("Comprehensive URL analysis with reliable screenshot verification")
     
     url = st.text_input("Enter URL to scan:", placeholder="https://example.com")
     
@@ -264,7 +284,7 @@ def main():
             if not processed_url:
                 st.error("Invalid URL format")
             else:
-                with st.spinner("🔍 Running comprehensive scan..."):
+                with st.spinner("🔍 Analyzing URL..."):
                     verdict, findings, service_status, screenshot, screenshot_error = perform_scan(processed_url)
                 display_results(verdict, findings, service_status, processed_url, screenshot, screenshot_error)
 
