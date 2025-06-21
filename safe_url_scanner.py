@@ -12,15 +12,16 @@ from functools import lru_cache
 # Configuration
 REQUEST_TIMEOUT = 20
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY', 'AIzaSyBQJ-_bb9zfC3S4pAehM4YrKJvU33goPBA')
-URLSCAN_API_KEY = os.getenv('URLSCAN_API_KEY', '')  # Register at urlscan.io for free API key
+URLSCAN_API_KEY = os.getenv('URLSCAN_API_KEY', '')
 
-# Trusted domains and threats (unchanged from your original)
+# Trusted domains
 TRUSTED_DOMAINS = {
     "apple.com", "google.com", "microsoft.com", 
     "amazon.com", "facebook.com", "wikipedia.org",
     "ku.edu.kw", "aasu.edu.kw"
 }
 
+# Known malicious patterns
 LOCAL_THREATS = {
     "apple-support-center.com": "Fake Apple support scam",
     "microsoft-help-desk.com": "Fake Microsoft support",
@@ -30,18 +31,7 @@ LOCAL_THREATS = {
     "free-software-downloads.com": "Malware distribution"
 }
 
-# --- Personal About Section ---
-def show_about():
-    st.sidebar.markdown("## About")
-    st.sidebar.markdown("""
-    **Abdulrahman Alamry**  
-    🎓 Software Engineering Student  
-    🏫 Abdullah Al Salem University  
-    🔒 Beginner Penetration Tester  
-    """)
-    st.sidebar.image("https://i.ibb.co/TqkMj2Hp/IMG-9641.jpg", width=150)
-
-# --- URL Processing ---
+# --- Helper Functions ---
 @lru_cache(maxsize=100)
 def process_url(url):
     """Standardize and validate URL"""
@@ -55,35 +45,14 @@ def process_url(url):
     except:
         return None
 
-# --- Reliable Screenshot Capture ---
-def get_website_screenshot(url):
-    """Get screenshot with multiple fallback services"""
-    services = [
-        {"url": "https://render-tron.appspot.com/screenshot/{url}?width=800&height=600", "timeout": 15},
-        {"url": "https://s0.wp.com/mshots/v1/{url}?w=800&h=600", "timeout": 10},
-        {"url": "https://api.pagepeeker.com/v2/thumbs.php?size=l&url={url}", "timeout": 10}
-    ]
-    
-    for service in services:
-        try:
-            response = requests.get(
-                service["url"].format(url=quote(url)),
-                stream=True,
-                timeout=service["timeout"],
-                headers={'User-Agent': 'Mozilla/5.0'}
-            )
-            response.raise_for_status()
-            img = Image.open(io.BytesIO(response.content))
-            if img.size[0] > 10:  # Validate image
-                return img
-        except:
-            continue
-    
-    return None
+def is_trusted_domain(url):
+    """Check if domain is in our trusted list"""
+    domain = urlparse(url).netloc.lower()
+    return any(domain.endswith(f".{t}") or domain == t for t in TRUSTED_DOMAINS)
 
-# --- Security Checks (Original + Enhanced) ---
+# --- Security Checks ---
 def check_local_database(url):
-    """Original local threat check"""
+    """Check against local threat database"""
     domain = urlparse(url).netloc.lower()
     for threat_domain, description in LOCAL_THREATS.items():
         if threat_domain in domain:
@@ -96,7 +65,7 @@ def check_local_database(url):
     return None
 
 def check_google_safebrowsing(url):
-    """Original Google Safe Browsing check"""
+    """Google Safe Browsing check"""
     try:
         response = requests.post(
             f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={GOOGLE_API_KEY}",
@@ -124,9 +93,8 @@ def check_google_safebrowsing(url):
     return None
 
 def check_urlscan(url):
-    """Enhanced URLScan.io integration"""
+    """URLScan.io integration"""
     try:
-        # Quick domain search
         domain = urlparse(url).netloc
         search_response = requests.get(
             f"https://urlscan.io/api/v1/search/?q=domain:{domain}",
@@ -147,7 +115,6 @@ def check_urlscan(url):
                 'details': f'https://urlscan.io/search/#{domain}'
             }
 
-        # Full scan if API key available
         if URLSCAN_API_KEY:
             submit_response = requests.post(
                 "https://urlscan.io/api/v1/scan/",
@@ -168,16 +135,39 @@ def check_urlscan(url):
         st.warning(f"URLScan.io check failed: {str(e)}")
         return None
 
+# --- Screenshot Function ---
+def get_website_screenshot(url):
+    """Get website screenshot"""
+    services = [
+        {"url": "https://render-tron.appspot.com/screenshot/{url}?width=800&height=600", "timeout": 15},
+        {"url": "https://s0.wp.com/mshots/v1/{url}?w=800&h=600", "timeout": 10}
+    ]
+    
+    for service in services:
+        try:
+            response = requests.get(
+                service["url"].format(url=quote(url)),
+                stream=True,
+                timeout=service["timeout"],
+                headers={'User-Agent': 'Mozilla/5.0'}
+            )
+            response.raise_for_status()
+            img = Image.open(io.BytesIO(response.content))
+            if img.size[0] > 10:
+                return img
+        except:
+            continue
+    return None
+
 # --- Scanning Logic ---
 def perform_scan(url):
-    """Perform all security checks and capture screenshot"""
+    """Perform all checks"""
     if is_trusted_domain(url):
         return 'trusted', [], [], None, None
 
     screenshot = None
     screenshot_error = None
     
-    # Get screenshot in parallel with security checks
     with concurrent.futures.ThreadPoolExecutor() as executor:
         screenshot_future = executor.submit(get_website_screenshot, url)
         
@@ -199,7 +189,7 @@ def perform_scan(url):
 
         screenshot = screenshot_future.result()
         if not screenshot:
-            screenshot_error = "All screenshot services failed"
+            screenshot_error = "Could not capture screenshot"
 
         if urlscan_result and not urlscan_result.get('safe'):
             return 'unsafe', [urlscan_result] + findings, service_status, screenshot, screenshot_error
@@ -210,7 +200,7 @@ def perform_scan(url):
 
 # --- Display Results ---
 def display_results(verdict, findings, service_status, url, screenshot, screenshot_error):
-    """Show results with screenshot"""
+    """Show results"""
     st.subheader(f"Scan Results for: {url}")
     
     col1, col2 = st.columns([2, 1])
@@ -221,7 +211,7 @@ def display_results(verdict, findings, service_status, url, screenshot, screensh
             'safe': ('🟢', 'No Threats Found'),
             'suspicious': ('🟡', 'Potential Risk'),
             'unsafe': ('🔴', 'Malicious Detected'),
-            'unknown': ('⚪', 'Inconclusive Results')
+            'unknown': ('⚪', 'Inconclusive')
         }
         emoji, status = verdicts.get(verdict, ('❓', 'Unknown'))
         st.markdown(f"### {emoji} {status}")
@@ -256,7 +246,17 @@ def main():
         page_icon="🛡️", 
         layout="centered"
     )
-    show_about()
+    
+    # About section
+    st.sidebar.markdown("## About")
+    st.sidebar.markdown("""
+    **Abdulrahman Alamry**  
+    🎓 Software Engineering Student  
+    🏫 Abdullah Al Salem University  
+    🔒 Beginner Penetration Tester  
+    """)
+    st.sidebar.image("https://i.ibb.co/TqkMj2Hp/IMG-9641.jpg", width=150)
+    
     st.title("🛡️ SecureURL Scanner")
     st.caption("Comprehensive URL analysis with screenshot verification")
     
